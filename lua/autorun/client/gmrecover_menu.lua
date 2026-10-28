@@ -32,7 +32,7 @@ local SETTINGS = {
     { "gmrecover_keep",        "T2 snapshots kept",                            1,   50,   0 },
     { "gmrecover_max_speed",   "Skip contraptions faster than (u/s, 0 = off)", 0,   2000, 0 },
     { "gmrecover_level",       "Compression level (zstd)",                     1,   19,   0 },
-    { "gmrecover_budget_ms",   "Lua budget per tick (ms)",                     0.1, 20,   1 },
+    { "gmrecover_budget_ms",   "Lua budget per tick (ms, 0 = auto)",           0,   20,   1 },
     { "gmrecover_holdoff",     "Autosave pause after crash (s)",               0,   3600, 0 },
     { "gmrecover_autorestore", "Auto-restore after crash (s, 0 = off)",        0,   3600, 0 },
 }

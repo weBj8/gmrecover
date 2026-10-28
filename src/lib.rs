@@ -2,6 +2,7 @@
 //! Lua serializes state; this DLL compresses, checksums and writes it on worker threads.
 //! Callbacks run on the main thread via rsgdll's executor, so Lua is never touched off-thread.
 
+pub mod json;
 pub mod store;
 
 use std::collections::HashMap;
@@ -105,6 +106,13 @@ fn list(slot: String) -> Result<Vec<String>> {
     store::list_all(&dirs)
         .map(|v| v.iter().map(|p| p.display().to_string()).collect())
         .map_err(|e| anyhow!("list: {e}"))
+}
+
+/// Lua: `gmrecover.EncodeJson(tab) -> json`; same output contract as `util.TableToJSON(wrap(tab))`.
+/// Runs on the calling Lua thread (main-thread work, no worker).
+#[rsgdll::function]
+fn encode_json(lua: &Lua, tab: LuaTable) -> Result<LuaBytes> {
+    json::encode(lua, &tab).map(LuaBytes)
 }
 
 #[cfg(test)]

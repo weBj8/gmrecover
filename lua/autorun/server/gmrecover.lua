@@ -19,13 +19,16 @@ local cv_t1_keep = CreateConVar("gmrecover_t1_keep", "3", FLAGS, "T1 (OS temp di
 local cv_max_speed = CreateConVar("gmrecover_max_speed", "50", FLAGS,
     "Skip contraptions moving faster than this many units/s (0 = save everything)", 0)
 local cv_level = CreateConVar("gmrecover_level", "3", FLAGS, "zstd level (1-19)", 1, 19)
-local cv_budget = CreateConVar("gmrecover_budget_ms", "2", FLAGS, "Max ms of Lua work per tick", 0.1, 50)
+local cv_budget = CreateConVar("gmrecover_budget_ms", "0", FLAGS,
+    "Max ms of Lua work per tick (0 = auto: 20% of the server tick interval)", 0, 50)
 local cv_holdoff = CreateConVar("gmrecover_holdoff", "600", FLAGS,
     "After a crash, delay autosave this many seconds unless restored/discarded", 0)
 local cv_autorestore = CreateConVar("gmrecover_autorestore", "5", FLAGS,
     "Restore the last snapshot this many seconds after map load, after crash/shutdown/changelevel (0 = off)", 0)
 
+local cv_debug = CreateConVar("gmrecover_debug", "0", FLAGS, "Log per-record save/restore details", 0, 1)
 local function log(...) MsgN("[gmrecover] ", ...) end
+local function debug_log(...) if cv_debug:GetBool() then log(...) end end
 local function slot() return (game.GetMap():gsub("[^%w_%-]", "_")) end
 
 -- ---------- settings persistence ----------
@@ -129,16 +132,23 @@ local function start_job(name, fn)
 end
 
 --- Inside a job: wall time, main-thread Lua time (incl. the running slice) and ticks so far, as text.
+--- Inside a job: main-thread Lua seconds so far, incl. the running slice.
+local function job_cpu() return job.cpu + SysTime() - job.slice end
 local function job_timing()
-    local now = SysTime()
     return ("%.0f ms wall, %.1f ms Lua over %d ticks")
-        :format((now - job.start) * 1000, (job.cpu + now - job.slice) * 1000, job.ticks)
+        :format((SysTime() - job.start) * 1000, job_cpu() * 1000, job.ticks)
+end
+
+--- Per-tick budget in seconds; auto scales with tickrate (66 tick: 3 ms, 33 tick: 6 ms).
+local function budget()
+    local ms = cv_budget:GetFloat()
+    return ms > 0 and ms / 1000 or engine.TickInterval() * 0.2
 end
 
 hook.Add("Think", "gmrecover.job", function()
     if not job then return end
     job.slice = SysTime()
-    deadline = job.slice + cv_budget:GetFloat() / 1000
+    deadline = job.slice + budget()
     job.ticks = job.ticks + 1
     local ok, err = coroutine.resume(job.co)
     job.cpu = job.cpu + SysTime() - job.slice
@@ -304,7 +314,12 @@ local function unwrap(v)
     end
     return v
 end
-local function to_json(t, memo) return util.TableToJSON(wrap(t, memo or new_memo())) end
+-- Native encoder (same output contract, one pass, no memo); Lua path kept for older DLLs.
+local native_json = isfunction(gmrecover.EncodeJson) and gmrecover.EncodeJson
+local function to_json(t, memo)
+    if native_json then return native_json(t) end
+    return util.TableToJSON(wrap(t, memo or new_memo()))
+end
 local function from_json(j)
     local t = j and util.JSONToTable(j)
     return t and unwrap(t)
@@ -321,6 +336,19 @@ do -- self-check
     assert(t["123"] == bin and t[5] == "a" and t.v == Vector(1, 2, 3) and t["~s:x"] == 1 and t["~s:123"] == 2
         and t.s1.b == bin and t.s2.b == bin and t.p.a == 1, "gmrecover json self-check")
     assert(src["123"] == bin and src.s1.b == bin, "gmrecover json self-check: source untouched")
+    if native_json then
+        local function check(n)
+            return n and n["123"] == bin and n[5] == "a" and n.v == Vector(1, 2, 3) and n["~s:x"] == 1
+                and n["~s:123"] == 2 and n.s2.b == bin and n.p.a == 1
+        end
+        assert(check(from_json(native_json(src))), "gmrecover native json self-check")
+        -- saves encode inside a coroutine, where ILuaBase uses a different stack; check there too
+        local deep = { a = { b = { v = Vector(1, 2, 3), w = Angle(1, 2, 3), x = 1, y = 2 } } }
+        local ok, j = coroutine.resume(coroutine.create(function() return native_json(deep) end))
+        local d = ok and from_json(j)
+        assert(d and d.a.b.v == Vector(1, 2, 3) and d.a.b.w == Angle(1, 2, 3) and d.a.b.x == 1 and d.a.b.y == 2,
+            "gmrecover native json self-check (coroutine): " .. tostring(j))
+    end
 end
 
 -- ---------- contraptions ----------
@@ -438,7 +466,7 @@ local function serialize(carry)
                                     info
                             }
                         elseif isstring(info) then
-                            log("skipped ", tostring(e), ": ", info)
+                            debug_log("skipped ", tostring(e), ": ", info)
                         end
                     end
                     yield_if_spent()
@@ -459,10 +487,13 @@ local function serialize(carry)
             yield_if_spent()
         end
     end
+    local copy_cpu = job_cpu()
     -- Phase 2: JSON encoding, spread across ticks; entity state no longer matters here.
-    local count, memo = 0, new_memo()
+    local count, memo, enc_t = 0, new_memo(), 0
     for _, c in ipairs(copies) do
+        local t0 = SysTime()
         local ok, json = pcall(to_json, c.tab, memo)
+        enc_t = enc_t + SysTime() - t0
         if ok and json then
             if c.kind == "E" then
                 lines[#lines + 1] = table.concat({ "E", c.sid, c.idx, json, util.TableToJSON(c.info) }, "\t")
@@ -471,7 +502,7 @@ local function serialize(carry)
                 lines[#lines + 1] = "C\t" .. c.sid .. "\t" .. json
             end
         else
-            log("skipped record: ", tostring(json))
+            debug_log("skipped record: ", tostring(json))
         end
         yield_if_spent()
     end
@@ -479,7 +510,12 @@ local function serialize(carry)
     for _, block in ipairs(carry) do
         for _, l in ipairs(block) do lines[#lines + 1] = l end
     end
-    return table.concat(lines, "\n"), count, skipped
+    local json_cpu = job_cpu()
+    local out = table.concat(lines, "\n")
+    local phases = ("scan+copy %.1f ms, json %.1f ms [%s encode %.1f], concat %.1f ms")
+        :format(copy_cpu * 1000, (json_cpu - copy_cpu) * 1000, native_json and "native" or "lua",
+            enc_t * 1000, (job_cpu() - json_cpu) * 1000)
+    return out, count, skipped, phases
 end
 
 local function parse(data)
@@ -676,7 +712,7 @@ local function save(reason, tier)
     return start_job("save", function()
         local carry = {}
         for _, g in pairs(pending) do carry[#carry + 1] = g.lines end
-        local data, count, skipped = serialize(carry)
+        local data, count, skipped, phases = serialize(carry)
         count = count + #carry
         if skipped > 0 then log(skipped, " moving entities not saved (", reason, ")") end
         if count == 0 then
@@ -684,7 +720,7 @@ local function save(reason, tier)
             return
         end
         last_data = { data = data, count = count, time = CurTime() }
-        write_tier(tier, data, count, reason, job_timing())
+        write_tier(tier, data, count, reason, job_timing() .. " (" .. phases .. ")")
     end)
 end
 

@@ -29,7 +29,7 @@ Server console or superadmin:
 | `gmrecover_keep` | 5 | T2 snapshots kept per map |
 | `gmrecover_max_speed` | 50 | Skip contraptions faster than N units/s (0 = save all) |
 | `gmrecover_level` | 3 | zstd level 1-19 |
-| `gmrecover_budget_ms` | 2 | Lua work per tick |
+| `gmrecover_budget_ms` | 0 | Lua work per tick (ms); 0 = auto, 20% of tick interval |
 | `gmrecover_autorestore` | 0 | Auto-restore N s after a crash (0 = manual) |
 | `gmrecover_holdoff` | 600 | Autosave delay at startup when snapshots exist |
 
