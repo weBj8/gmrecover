@@ -75,6 +75,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild@0.24.0,cargo-xwin@0.23.1
+      # cc-rs needs llvm-lib; runner ships LLVM outside PATH.
+      - name: Add LLVM to PATH
+        if: matrix.cargo != 'zigbuild'
+        run: |
+          llvm_bin="$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -1)"
+          test -x "$llvm_bin/llvm-lib"
+          echo "$llvm_bin" >> "$GITHUB_PATH"
       - name: Cache MSVC CRT/SDK (cargo-xwin)
         if: matrix.cargo != 'zigbuild'
         uses: actions/cache@v6
