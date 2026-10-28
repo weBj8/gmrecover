@@ -1,0 +1,30 @@
+[package]
+name = "gmrecover"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["server"]
+server = []
+# Declared because rsgdll macros emit cfgs for them; this module is server-only.
+client = []
+menu = []
+
+[dependencies]
+rsgdll = { git = "https://github.com/weBj8/rsgdll.git", rev = "e7edbecdf798acf566748e3a443f2d227bd703f3" }
+zstd = { version = "0.13", default-features = false }
+crc32fast = "1.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = "line-tables-only"
+panic = "unwind"
+lto = "thin"

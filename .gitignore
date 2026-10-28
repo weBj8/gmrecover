@@ -1,0 +1,8 @@
+/target
+/.agents/skills
+/.pi
+/skills-lock.json
+!/.pi/
+/.pi/*
+!/.pi/realctx/
+!/.pi/realctx/**
