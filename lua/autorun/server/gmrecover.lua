@@ -124,23 +124,40 @@ local function start_job(name, fn)
         log("busy: ", job.name, " still running")
         return false
     end
-    job = { name = name, co = coroutine.create(fn) }
+    job = { name = name, co = coroutine.create(fn), start = SysTime(), cpu = 0, ticks = 0 }
     return true
+end
+
+--- Inside a job: wall time, main-thread Lua time (incl. the running slice) and ticks so far, as text.
+local function job_timing()
+    local now = SysTime()
+    return ("%.0f ms wall, %.1f ms Lua over %d ticks")
+        :format((now - job.start) * 1000, (job.cpu + now - job.slice) * 1000, job.ticks)
 end
 
 hook.Add("Think", "gmrecover.job", function()
     if not job then return end
-    deadline = SysTime() + cv_budget:GetFloat() / 1000
+    job.slice = SysTime()
+    deadline = job.slice + cv_budget:GetFloat() / 1000
+    job.ticks = job.ticks + 1
     local ok, err = coroutine.resume(job.co)
+    job.cpu = job.cpu + SysTime() - job.slice
     if not ok then log(job.name, " failed: ", tostring(err)) end
     if not ok or coroutine.status(job.co) == "dead" then job = nil end
 end)
 
 -- ---------- ownership ----------
+local sid_of = setmetatable({}, { __mode = "k" }) -- ply -> SteamID64; one C call per player, not per entity
 local function owner_sid(ent)
     if not ent.CPPIGetOwner then return nil end
     local ply = ent:CPPIGetOwner()
-    return IsValid(ply) and ply:IsPlayer() and ply:SteamID64() or nil
+    if not (IsValid(ply) and ply:IsPlayer()) then return nil end
+    local sid = sid_of[ply]
+    if not sid then
+        sid = ply:SteamID64()
+        sid_of[ply] = sid
+    end
+    return sid
 end
 
 local function savable(ent)
@@ -228,36 +245,82 @@ end
 -- JSONToTable turns numeric string keys ("123") into numbers. Wrap both so dupes round-trip.
 local BIN, SKEY = "~b", "~s:"
 local function is_binary(v) return v:find("[%z\1-\8\11\12\14-\31\127-\255]") ~= nil end
-local function wrap(v, seen)
-    if isstring(v) then return is_binary(v) and { [BIN] = util.Base64Encode(v, true) } or v end
-    if not istable(v) or seen[v] then return v end
-    seen[v] = true
-    local out = {}
-    for k, x in pairs(v) do
-        local key = (isstring(k) and (tonumber(k) or k:sub(1, #SKEY) == SKEY)) and SKEY .. k or k
-        out[key] = wrap(x, seen)
+local function new_memo() return { vals = {}, keys = {} } end
+-- Dupes repeat the same keys and strings (Pos, Angle, model paths) thousands of times; memo caches each
+-- transform once per save. Tables with nothing to escape are returned as-is (copy-on-write), not copied.
+local function wrap_key(k, keys)
+    local r = keys[k]
+    if r == nil then
+        r = (tonumber(k) or k:sub(1, #SKEY) == SKEY) and SKEY .. k or k
+        keys[k] = r
     end
+    return r
+end
+local function wrap(v, memo)
+    local t = type(v)
+    if t ~= "string" and t ~= "table" then return v end
+    local vals = memo.vals
+    local r = vals[v]
+    if r ~= nil then return r end
+    if t == "string" then
+        r = is_binary(v) and { [BIN] = util.Base64Encode(v, true) } or v
+        vals[v] = r
+        return r
+    end
+    vals[v] = v -- cycle guard; replaced below if a copy is needed
+    local keys, changed = memo.keys, false
+    for k, x in pairs(v) do
+        if (type(k) == "string" and wrap_key(k, keys) ~= k) or wrap(x, memo) ~= x then
+            changed = true
+            break
+        end
+    end
+    local out = v
+    if changed then -- fresh table: renamed keys must not clobber originals; memo makes this pass cheap
+        out = {}
+        for k, x in pairs(v) do
+            out[type(k) == "string" and wrap_key(k, keys) or k] = wrap(x, memo)
+        end
+    end
+    vals[v] = out
     return out
 end
+-- JSONToTable output is fresh, so unwrap edits it in place.
 local function unwrap(v)
-    if not istable(v) then return v end
+    if type(v) ~= "table" then return v end
     if isstring(v[BIN]) and next(v, next(v)) == nil then return util.Base64Decode(v[BIN]) end
-    local out = {}
+    local renamed
     for k, x in pairs(v) do
-        local key = (isstring(k) and k:sub(1, #SKEY) == SKEY) and k:sub(#SKEY + 1) or k
-        out[key] = unwrap(x)
+        v[k] = unwrap(x) -- assigning an existing key is safe during pairs
+        if type(k) == "string" and k:sub(1, #SKEY) == SKEY then
+            renamed = renamed or {}
+            renamed[#renamed + 1] = k
+        end
     end
-    return out
+    if renamed then -- remove all first, so "~s:~s:x" -> "~s:x" can't collide with a pending "~s:x"
+        local vals = {}
+        for i, k in ipairs(renamed) do vals[i], v[k] = v[k], nil end
+        for i, k in ipairs(renamed) do v[k:sub(#SKEY + 1)] = vals[i] end
+    end
+    return v
 end
-local function to_json(t) return util.TableToJSON(wrap(t, {})) end
+local function to_json(t, memo) return util.TableToJSON(wrap(t, memo or new_memo())) end
 local function from_json(j)
     local t = j and util.JSONToTable(j)
     return t and unwrap(t)
 end
 do -- self-check
     local bin = "\0\255x\n"
-    local t = from_json(to_json({ ["123"] = bin, [5] = "a", v = Vector(1, 2, 3), ["~s:x"] = 1 }))
-    assert(t["123"] == bin and t[5] == "a" and t.v == Vector(1, 2, 3) and t["~s:x"] == 1, "gmrecover json self-check")
+    local shared = { b = bin }
+    local plain = { a = 1 }
+    local src = { ["123"] = bin, [5] = "a", v = Vector(1, 2, 3), ["~s:x"] = 1, ["~s:123"] = 2,
+        s1 = shared, s2 = shared, p = plain }
+    local memo = new_memo()
+    assert(wrap(plain, memo) == plain, "gmrecover json self-check: copy-on-write")
+    local t = from_json(to_json(src, memo))
+    assert(t["123"] == bin and t[5] == "a" and t.v == Vector(1, 2, 3) and t["~s:x"] == 1 and t["~s:123"] == 2
+        and t.s1.b == bin and t.s2.b == bin and t.p.a == 1, "gmrecover json self-check")
+    assert(src["123"] == bin and src.s1.b == bin, "gmrecover json self-check: source untouched")
 end
 
 -- ---------- contraptions ----------
@@ -283,9 +346,9 @@ local function contraption(ent)
     return out
 end
 
-local function speed(ent)
+local function speed_sqr(ent)
     local phys = ent:GetPhysicsObject()
-    return (IsValid(phys) and phys:GetVelocity() or ent:GetVelocity()):Length()
+    return (IsValid(phys) and phys:GetVelocity() or ent:GetVelocity()):LengthSqr()
 end
 
 --- World pose of an entity and its bones; cheap, so a whole contraption is taken in one tick.
@@ -333,6 +396,7 @@ local function serialize(carry)
     -- Phase 1: table copies spread across ticks. A moving contraption's poses are taken in one tick first
     -- (positions only, cheap) and written into its copies, so parts stay consistent with each other.
     local max_speed = cv_max_speed:GetFloat()
+    local max_sqr = max_speed * max_speed
     local done, copies, skipped = {}, {}, 0
     for _, root in ipairs(list) do
         if IsValid(root) and not done[root] then
@@ -344,9 +408,9 @@ local function serialize(carry)
             end
             local fast, moving = false, false
             for _, e in ipairs(members) do
-                local v = speed(e)
+                local v = speed_sqr(e)
                 moving = moving or v > 1
-                if max_speed > 0 and v > max_speed then
+                if max_speed > 0 and v > max_sqr then
                     fast = true
                     break
                 end
@@ -396,9 +460,9 @@ local function serialize(carry)
         end
     end
     -- Phase 2: JSON encoding, spread across ticks; entity state no longer matters here.
-    local count = 0
+    local count, memo = 0, new_memo()
     for _, c in ipairs(copies) do
-        local ok, json = pcall(to_json, c.tab)
+        local ok, json = pcall(to_json, c.tab, memo)
         if ok and json then
             if c.kind == "E" then
                 lines[#lines + 1] = table.concat({ "E", c.sid, c.idx, json, util.TableToJSON(c.info) }, "\t")
@@ -430,10 +494,10 @@ local function parse(data)
         return g
     end
     for line in data:gmatch("[^\n]+") do
-        local kind = line:sub(1, 1)
-        if kind == "H" then
+        local kind = line:byte(1)
+        if kind == 72 then -- H
             header = util.JSONToTable(line:sub(3))
-        elseif kind == "E" then
+        elseif kind == 69 then -- E
             local sid, idx, json, fz = line:match("^E\t(%d+)\t(%d+)\t([^\t]*)\t([^\t]*)$")
             local tab = from_json(json)
             if tab then
@@ -443,7 +507,7 @@ local function parse(data)
                 g.lines[#g.lines + 1] = line
                 g.count = g.count + 1
             end
-        elseif kind == "C" then
+        elseif kind == 67 then -- C
             local sid, json = line:match("^C\t(%d+)\t(.*)$")
             local tab = from_json(json)
             if tab then
@@ -588,14 +652,17 @@ local holdoff_until = 0
 local last_save = { time = 0, path = "", count = 0 }
 local last_data -- { data, count, time }: newest T1 serialization, reused by T2 to skip re-copying
 
-local function write_tier(tier, data, count, reason)
+local function write_tier(tier, data, count, reason, timing)
     local keep = tier == 1 and cv_t1_keep:GetInt() or cv_keep:GetInt()
+    local t0 = SysTime()
     gmrecover.Save(slot(), data, keep, cv_level:GetInt(), tier, function(err, path)
+        local write_ms = (SysTime() - t0) * 1000
         if err then
             log("T", tier, " save failed: ", err)
         elseif path then
             last_save = { time = os.time(), path = path, count = count }
-            log("T", tier, " saved ", count, " entities (", reason, ") -> ", path)
+            log("T", tier, " saved ", count, " entities (", reason, ") -> ", path, " [",
+                timing and ("serialize " .. timing .. "; ") or "", ("compress+write %.0f ms]"):format(write_ms))
         end
     end)
 end
@@ -617,7 +684,7 @@ local function save(reason, tier)
             return
         end
         last_data = { data = data, count = count, time = CurTime() }
-        write_tier(tier, data, count, reason)
+        write_tier(tier, data, count, reason, job_timing())
     end)
 end
 
