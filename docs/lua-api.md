@@ -2,9 +2,9 @@
 
 ```lua
 require("gmrecover")
-gmrecover.Save(slot, data, keep, level, function(err, path) end) -- path nil: unchanged, skipped
-gmrecover.Load(slot, function(err, data, path) end)              -- data nil: no valid snapshot
-gmrecover.List(slot) -- { path, ... } newest first
+gmrecover.Save(slot, data, keep, level, tier, function(err, path) end) -- tier 1 temp, 2 data; path nil: unchanged
+gmrecover.Load(slot, function(err, data, path) end)              -- newest valid of both tiers; data nil: none
+gmrecover.List(slot) -- { path, ... } both tiers, newest first
 ```
 
 `slot`: `[A-Za-z0-9_-]`, max 64 chars.

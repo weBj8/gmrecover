@@ -23,14 +23,17 @@ Server console or superadmin:
 | ConVar | Default | Meaning |
 |---|---|---|
 | `gmrecover_enabled` | 1 | Autosave on/off |
-| `gmrecover_interval` | 60 | Seconds between saves (min 10) |
-| `gmrecover_keep` | 5 | Snapshots kept per map |
+| `gmrecover_t1_interval` | 15 | T1 seconds between saves (OS temp dir, 0 = off) |
+| `gmrecover_t1_keep` | 3 | T1 snapshots kept per map |
+| `gmrecover_interval` | 60 | T2 seconds between saves (`data/`, min 10) |
+| `gmrecover_keep` | 5 | T2 snapshots kept per map |
+| `gmrecover_max_speed` | 50 | Skip contraptions faster than N units/s (0 = save all) |
 | `gmrecover_level` | 3 | zstd level 1-19 |
 | `gmrecover_budget_ms` | 2 | Lua work per tick |
 | `gmrecover_autorestore` | 0 | Auto-restore N s after a crash (0 = manual) |
 | `gmrecover_holdoff` | 600 | Autosave delay at startup when snapshots exist |
 
-Snapshots: `garrysmod/data/gmrecover/<map>/snapshot_<unix-ms>.gmr`.
+Snapshots: T1 `<tmp>/gmrecover-<hash>/<map>/`, T2 `garrysmod/data/gmrecover/<map>/`, files `snapshot_<unix-ms>.gmr`. Restore takes the newest valid one of either tier. T1 is lost on host reboot.
 
 ## Build
 

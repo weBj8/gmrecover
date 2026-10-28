@@ -11,8 +11,13 @@ require("gmrecover")
 local FORMAT = 2 -- 2: AdvDupe2 tables; 1 (vanilla duplicator) is not restorable
 local FLAGS = { FCVAR_ARCHIVE, FCVAR_PROTECTED }
 local cv_enabled = CreateConVar("gmrecover_enabled", "1", FLAGS, "Autosave on/off", 0, 1)
-local cv_interval = CreateConVar("gmrecover_interval", "60", FLAGS, "Seconds between autosaves", 10)
-local cv_keep = CreateConVar("gmrecover_keep", "5", FLAGS, "Snapshots kept on disk", 1, 1000)
+local cv_interval = CreateConVar("gmrecover_interval", "60", FLAGS, "T2 (data/) seconds between autosaves", 10)
+local cv_keep = CreateConVar("gmrecover_keep", "5", FLAGS, "T2 (data/) snapshots kept", 1, 1000)
+local cv_t1_interval = CreateConVar("gmrecover_t1_interval", "15", FLAGS,
+    "T1 (OS temp dir) seconds between autosaves (0 = off)", 0)
+local cv_t1_keep = CreateConVar("gmrecover_t1_keep", "3", FLAGS, "T1 (OS temp dir) snapshots kept", 1, 1000)
+local cv_max_speed = CreateConVar("gmrecover_max_speed", "50", FLAGS,
+    "Skip contraptions moving faster than this many units/s (0 = save everything)", 0)
 local cv_level = CreateConVar("gmrecover_level", "3", FLAGS, "zstd level (1-19)", 1, 19)
 local cv_budget = CreateConVar("gmrecover_budget_ms", "2", FLAGS, "Max ms of Lua work per tick", 0.1, 50)
 local cv_holdoff = CreateConVar("gmrecover_holdoff", "600", FLAGS,
@@ -25,7 +30,8 @@ local function slot() return (game.GetMap():gsub("[^%w_%-]", "_")) end
 
 -- ---------- settings persistence ----------
 -- FCVAR_ARCHIVE is only written on clean shutdown; a crash would lose changes, so mirror to data/.
-local SETTINGS = { "gmrecover_enabled", "gmrecover_interval", "gmrecover_keep", "gmrecover_level",
+local SETTINGS = { "gmrecover_enabled", "gmrecover_interval", "gmrecover_keep", "gmrecover_t1_interval",
+    "gmrecover_t1_keep", "gmrecover_max_speed", "gmrecover_level",
     "gmrecover_budget_ms", "gmrecover_holdoff", "gmrecover_autorestore" }
 local SETTINGS_FILE = "gmrecover/settings.json"
 local is_setting = {}
@@ -114,7 +120,10 @@ local function yield_if_spent()
 end
 
 local function start_job(name, fn)
-    if job then log("busy: ", job.name, " still running") return false end
+    if job then
+        log("busy: ", job.name, " still running")
+        return false
+    end
     job = { name = name, co = coroutine.create(fn) }
     return true
 end
@@ -171,8 +180,13 @@ local function copy_entity(api, ent)
         local phys = ent:GetPhysicsObjectNum(b)
         if IsValid(phys) then
             local moving = phys:IsMoveable()
-            bones[b] = { phys = phys, moving = moving, asleep = phys:IsAsleep(),
-                vel = phys:GetVelocity(), angvel = phys:GetAngleVelocity() }
+            bones[b] = {
+                phys = phys,
+                moving = moving,
+                asleep = phys:IsAsleep(),
+                vel = phys:GetVelocity(),
+                angvel = phys:GetAngleVelocity()
+            }
             frozen[b] = not moving
         end
     end
@@ -209,6 +223,65 @@ local function constraint_owner(con, owner_of)
     return sid
 end
 
+-- ---------- binary-safe JSON ----------
+-- util.TableToJSON corrupts binary strings (Prop2Mesh partlists are util.Compress output) and
+-- JSONToTable turns numeric string keys ("123") into numbers. Wrap both so dupes round-trip.
+local BIN, SKEY = "~b", "~s:"
+local function is_binary(v) return v:find("[%z\1-\8\11\12\14-\31\127-\255]") ~= nil end
+local function wrap(v, seen)
+    if isstring(v) then return is_binary(v) and { [BIN] = util.Base64Encode(v, true) } or v end
+    if not istable(v) or seen[v] then return v end
+    seen[v] = true
+    local out = {}
+    for k, x in pairs(v) do
+        local key = (isstring(k) and (tonumber(k) or k:sub(1, #SKEY) == SKEY)) and SKEY .. k or k
+        out[key] = wrap(x, seen)
+    end
+    return out
+end
+local function unwrap(v)
+    if not istable(v) then return v end
+    if isstring(v[BIN]) and next(v, next(v)) == nil then return util.Base64Decode(v[BIN]) end
+    local out = {}
+    for k, x in pairs(v) do
+        local key = (isstring(k) and k:sub(1, #SKEY) == SKEY) and k:sub(#SKEY + 1) or k
+        out[key] = unwrap(x)
+    end
+    return out
+end
+local function to_json(t) return util.TableToJSON(wrap(t, {})) end
+local function from_json(j)
+    local t = j and util.JSONToTable(j)
+    return t and unwrap(t)
+end
+do -- self-check
+    local bin = "\0\255x\n"
+    local t = from_json(to_json({ ["123"] = bin, [5] = "a", v = Vector(1, 2, 3), ["~s:x"] = 1 }))
+    assert(t["123"] == bin and t[5] == "a" and t.v == Vector(1, 2, 3) and t["~s:x"] == 1, "gmrecover json self-check")
+end
+
+-- ---------- contraptions ----------
+--- Everything welded/constrained/parented to `ent`, so a contraption is copied in one tick
+--- (a copy spread over ticks of a moving tank stores parts at different poses).
+local function contraption(ent)
+    local out, stack = {}, { ent }
+    while #stack > 0 do
+        local e = table.remove(stack)
+        if IsValid(e) and not out[e] then
+            out[e] = true
+            for c in pairs(constraint.GetAllConstrainedEntities(e) or {}) do stack[#stack + 1] = c end
+            for _, c in ipairs(e:GetChildren()) do stack[#stack + 1] = c end
+            stack[#stack + 1] = e:GetParent()
+        end
+    end
+    return out
+end
+
+local function speed(ent)
+    local phys = ent:GetPhysicsObject()
+    return (IsValid(phys) and phys:GetVelocity() or ent:GetVelocity()):Length()
+end
+
 -- ---------- serialization ----------
 -- One record per line, so save and restore can both be spread across ticks:
 --   H\t<json header>
@@ -222,35 +295,85 @@ local function serialize(carry)
     for _, ent in ents.Iterator() do
         if savable(ent) then
             local sid = owner_sid(ent)
-            if sid then owner_of[ent] = sid; list[#list + 1] = ent end
+            if sid then
+                owner_of[ent] = sid; list[#list + 1] = ent
+            end
         end
     end
     yield_if_spent()
-    local seen, count = {}, 0
-    for _, ent in ipairs(list) do
-        if IsValid(ent) then
-            -- tab nil + info nil: AD2 says not copyable (DoNotDuplicate etc.), skip silently
-            local tab, info = copy_entity(api, ent)
-            local ok, json = tab ~= nil, nil
-            if tab then ok, json = pcall(util.TableToJSON, tab) end
-            if ok and json then
-                lines[#lines + 1] = table.concat({ "E", owner_of[ent], ent:EntIndex(), json,
-                    util.TableToJSON(info) }, "\t")
-                count = count + 1
-            elseif isstring(info) or isstring(json) then
-                log("skipped ", tostring(ent), ": ", tostring(isstring(info) and info or json))
+    -- Phase 1: table copies. Moving contraptions in one tick each (consistent poses), static ones across ticks.
+    local max_speed = cv_max_speed:GetFloat()
+    local done, copies, skipped = {}, {}, 0
+    for _, root in ipairs(list) do
+        if IsValid(root) and not done[root] then
+            local group = contraption(root)
+            local members = {}
+            for e in pairs(group) do
+                done[e] = true
+                if owner_of[e] and IsValid(e) then members[#members + 1] = e end
             end
-            for _, c in pairs(ent.Constraints or {}) do
-                if IsValid(c) and not seen[c] and not c.DoNotDuplicate then
-                    seen[c] = true
-                    local sid = constraint_owner(c:GetTable(), owner_of)
-                    local okc, ct = false, nil
-                    if sid then okc, ct = pcall(api.copy_con, table.Copy(c:GetTable()), ZERO_V) end
-                    local okj, cj = false, nil
-                    if okc and ct then okj, cj = pcall(util.TableToJSON, ct) end
-                    if okj and cj then lines[#lines + 1] = "C\t" .. sid .. "\t" .. cj end
+            local fast, moving = false, false
+            for _, e in ipairs(members) do
+                local v = speed(e)
+                moving = moving or v > 1
+                if max_speed > 0 and v > max_speed then
+                    fast = true
+                    break
                 end
             end
+            -- static builds can't drift between ticks, so only moving ones are copied in one tick
+            local step = moving and function() end or yield_if_spent
+            if fast then
+                skipped = skipped + #members
+            else
+                for _, e in ipairs(members) do
+                    if IsValid(e) then
+                        -- tab nil + info nil: AD2 says not copyable (DoNotDuplicate etc.), skip silently
+                        local tab, info = copy_entity(api, e)
+                        if tab then
+                            copies[#copies + 1] = {
+                                kind = "E",
+                                sid = owner_of[e],
+                                idx = e:EntIndex(),
+                                tab = tab,
+                                info =
+                                    info
+                            }
+                        elseif isstring(info) then
+                            log("skipped ", tostring(e), ": ", info)
+                        end
+                    end
+                    step()
+                end
+                for _, e in ipairs(members) do
+                    for _, c in pairs(e.Constraints or {}) do
+                        if IsValid(c) and not done[c] and not c.DoNotDuplicate then
+                            done[c] = true
+                            local sid = constraint_owner(c:GetTable(), owner_of)
+                            local okc, ct = false, nil
+                            if sid then okc, ct = pcall(api.copy_con, table.Copy(c:GetTable()), ZERO_V) end
+                            if okc and ct then copies[#copies + 1] = { kind = "C", sid = sid, tab = ct } end
+                        end
+                    end
+                    step()
+                end
+            end
+            yield_if_spent()
+        end
+    end
+    -- Phase 2: JSON encoding, spread across ticks; entity state no longer matters here.
+    local count = 0
+    for _, c in ipairs(copies) do
+        local ok, json = pcall(to_json, c.tab)
+        if ok and json then
+            if c.kind == "E" then
+                lines[#lines + 1] = table.concat({ "E", c.sid, c.idx, json, util.TableToJSON(c.info) }, "\t")
+                count = count + 1
+            else
+                lines[#lines + 1] = "C\t" .. c.sid .. "\t" .. json
+            end
+        else
+            log("skipped record: ", tostring(json))
         end
         yield_if_spent()
     end
@@ -258,7 +381,7 @@ local function serialize(carry)
     for _, block in ipairs(carry) do
         for _, l in ipairs(block) do lines[#lines + 1] = l end
     end
-    return table.concat(lines, "\n"), count
+    return table.concat(lines, "\n"), count, skipped
 end
 
 local function parse(data)
@@ -278,7 +401,7 @@ local function parse(data)
             header = util.JSONToTable(line:sub(3))
         elseif kind == "E" then
             local sid, idx, json, fz = line:match("^E\t(%d+)\t(%d+)\t([^\t]*)\t([^\t]*)$")
-            local tab = json and util.JSONToTable(json)
+            local tab = from_json(json)
             if tab then
                 local g, i = group(sid), tonumber(idx)
                 g.Entities[i] = tab
@@ -288,7 +411,7 @@ local function parse(data)
             end
         elseif kind == "C" then
             local sid, json = line:match("^C\t(%d+)\t(.*)$")
-            local tab = json and util.JSONToTable(json)
+            local tab = from_json(json)
             if tab then
                 local g = group(sid)
                 g.Constraints[#g.Constraints + 1] = tab
@@ -406,7 +529,10 @@ local function restore(data, path)
         notify(admins(), "error", "Snapshot was written by an older gmrecover version and cannot be restored.")
         return
     end
-    if header.map ~= game.GetMap() then log("snapshot is for map ", tostring(header.map)) return end
+    if header.map ~= game.GetMap() then
+        log("snapshot is for map ", tostring(header.map))
+        return
+    end
     local now, later = 0, 0
     for _, sid in ipairs(order) do
         local g = groups[sid]
@@ -426,30 +552,60 @@ end
 -- ---------- save / scheduling ----------
 local holdoff_until = 0
 local last_save = { time = 0, path = "", count = 0 }
-local function save(reason)
-    -- mid-restore the map is half pasted; a snapshot now would rotate out the good ones
-    if next(active) then log("save skipped (", reason, "): restore in progress") return false end
-    return start_job("save", function()
-        local carry = {}
-        for _, g in pairs(pending) do carry[#carry + 1] = g.lines end
-        local data, count = serialize(carry)
-        count = count + #carry
-        if count == 0 then log("nothing to save (", reason, ")") return end
-        gmrecover.Save(slot(), data, cv_keep:GetInt(), cv_level:GetInt(), function(err, path)
-            if err then log("save failed: ", err)
-            elseif path then
-                last_save = { time = os.time(), path = path, count = count }
-                log("saved ", count, " entities (", reason, ") -> ", path)
-            end
-        end)
+local last_data -- { data, count, time }: newest T1 serialization, reused by T2 to skip re-copying
+
+local function write_tier(tier, data, count, reason)
+    local keep = tier == 1 and cv_t1_keep:GetInt() or cv_keep:GetInt()
+    gmrecover.Save(slot(), data, keep, cv_level:GetInt(), tier, function(err, path)
+        if err then
+            log("T", tier, " save failed: ", err)
+        elseif path then
+            last_save = { time = os.time(), path = path, count = count }
+            log("T", tier, " saved ", count, " entities (", reason, ") -> ", path)
+        end
     end)
 end
 
-timer.Create("gmrecover.autosave", cv_interval:GetFloat(), 0, function()
-    if cv_enabled:GetBool() and CurTime() >= holdoff_until then save("auto") end
+local function save(reason, tier)
+    -- mid-restore the map is half pasted; a snapshot now would rotate out the good ones
+    if next(active) then
+        log("save skipped (", reason, "): restore in progress")
+        return false
+    end
+    return start_job("save", function()
+        local carry = {}
+        for _, g in pairs(pending) do carry[#carry + 1] = g.lines end
+        local data, count, skipped = serialize(carry)
+        count = count + #carry
+        if skipped > 0 then log(skipped, " moving entities not saved (", reason, ")") end
+        if count == 0 then
+            log("nothing to save (", reason, ")")
+            return
+        end
+        last_data = { data = data, count = count, time = CurTime() }
+        write_tier(tier, data, count, reason)
+    end)
+end
+
+local function autosave(tier)
+    if not cv_enabled:GetBool() or CurTime() < holdoff_until then return end
+    -- T2 copies T1's latest result when it is fresh enough: no extra main-thread work
+    if tier == 2 and last_data and CurTime() - last_data.time < cv_interval:GetFloat() then
+        write_tier(2, last_data.data, last_data.count, "auto, from T1")
+    else
+        save("auto", tier)
+    end
+end
+
+timer.Create("gmrecover.autosave", cv_interval:GetFloat(), 0, function() autosave(2) end)
+timer.Create("gmrecover.autosave_t1", math.max(cv_t1_interval:GetFloat(), 5), 0, function()
+    if cv_t1_interval:GetFloat() > 0 then autosave(1) end
 end)
 cvars.AddChangeCallback("gmrecover_interval", function(_, _, new)
     timer.Adjust("gmrecover.autosave", math.max(tonumber(new) or 60, 10))
+end, "gmrecover")
+cvars.AddChangeCallback("gmrecover_t1_interval", function(_, _, new)
+    timer.Adjust("gmrecover.autosave_t1", math.max(tonumber(new) or 15, 5))
 end, "gmrecover")
 for _, n in ipairs(SETTINGS) do cvars.AddChangeCallback(n, persist_settings, "gmrecover.persist") end
 
@@ -466,8 +622,16 @@ local function do_restore()
     recovery_pending = false
     timer.Remove("gmrecover.autorestore")
     gmrecover.Load(slot(), function(err, data, path)
-        if err then log("load failed: ", err) notify(admins(), "error", "Load failed: " .. err) return end
-        if not data then log("no valid snapshot for ", slot()) notify(admins(), "error", "No valid snapshot") return end
+        if err then
+            log("load failed: ", err)
+            notify(admins(), "error", "Load failed: " .. err)
+            return
+        end
+        if not data then
+            log("no valid snapshot for ", slot())
+            notify(admins(), "error", "No valid snapshot")
+            return
+        end
         if start_job("restore", function() restore(data, path) end) then
             log("restore started from ", path)
             notify(nil, "info", "Restoring builds from the last snapshot...")
@@ -542,9 +706,15 @@ end)
 
 local ACTIONS = {
     refresh = function() end,
-    save = function(ply) if save("manual by " .. ply:Nick()) then notify(ply, "info", "Save started") end end,
-    restore = function(ply) log(ply:Nick(), " requested restore") do_restore() end,
-    discard = function(ply) do_discard() notify(ply, "info", "Recovery discarded; autosave resumed") end,
+    save = function(ply) if save("manual by " .. ply:Nick(), 2) then notify(ply, "info", "Save started") end end,
+    restore = function(ply)
+        log(ply:Nick(), " requested restore")
+        do_restore()
+    end,
+    discard = function(ply)
+        do_discard()
+        notify(ply, "info", "Recovery discarded; autosave resumed")
+    end,
     set = function(ply, args)
         local name, value = args and args.name, args and args.value
         if not is_setting[name] or not tonumber(value) then return end
@@ -570,7 +740,7 @@ hook.Add("PlayerDisconnected", "gmrecover.ratelimit", function(ply) next_action[
 local function allowed(ply) return not IsValid(ply) or ply:IsSuperAdmin() end
 
 concommand.Add("gmrecover_save", function(ply)
-    if allowed(ply) and save("manual") then log("save started") end
+    if allowed(ply) and save("manual", 2) then log("save started") end
 end)
 
 concommand.Add("gmrecover_restore", function(ply)

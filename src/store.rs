@@ -57,6 +57,17 @@ pub fn list(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(v)
 }
 
+/// Snapshots of several dirs merged, newest first by file name (names embed the timestamp).
+pub fn list_all(dirs: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut v = dirs
+        .iter()
+        .map(|d| list(d))
+        .collect::<io::Result<Vec<_>>>()?
+        .concat();
+    v.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(v)
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -88,9 +99,9 @@ pub fn write(dir: &Path, data: &[u8], keep: usize) -> io::Result<PathBuf> {
     Ok(stamp)
 }
 
-/// Newest snapshot that decodes cleanly; corrupt ones are skipped.
-pub fn load_latest(dir: &Path) -> io::Result<Option<(PathBuf, Vec<u8>)>> {
-    Ok(list(dir)?.into_iter().find_map(|p| {
+/// Newest snapshot across `dirs` that decodes cleanly; corrupt ones are skipped.
+pub fn load_latest(dirs: &[PathBuf]) -> io::Result<Option<(PathBuf, Vec<u8>)>> {
+    Ok(list_all(dirs)?.into_iter().find_map(|p| {
         fs::read(&p)
             .and_then(|b| decode(&b))
             .ok()
@@ -128,7 +139,7 @@ mod tests {
         );
         // corrupt newest -> falls back to previous
         fs::write(&paths[4], b"garbage").unwrap();
-        let (p, raw) = load_latest(dir.path()).unwrap().unwrap();
+        let (p, raw) = load_latest(&[dir.path().to_path_buf()]).unwrap().unwrap();
         assert_eq!(p, paths[3]);
         assert_eq!(raw, vec![3u8; 64]);
     }
@@ -136,6 +147,26 @@ mod tests {
     #[test]
     fn empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_latest(&dir.path().join("missing")).unwrap().is_none());
+        assert!(
+            load_latest(&[dir.path().join("missing")])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn newest_across_tiers() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let dirs = [a.path().to_path_buf(), b.path().to_path_buf()];
+        let old = write(&dirs[1], &encode(b"t2", 3).unwrap(), 3).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let new = write(&dirs[0], &encode(b"t1", 3).unwrap(), 3).unwrap();
+        assert_eq!(list_all(&dirs).unwrap(), vec![new.clone(), old.clone()]);
+        assert_eq!(
+            load_latest(&dirs).unwrap().unwrap(),
+            (new.clone(), b"t1".to_vec())
+        );
+        fs::write(&new, b"bad").unwrap();
+        assert_eq!(load_latest(&dirs).unwrap().unwrap().0, old);
     }
 }

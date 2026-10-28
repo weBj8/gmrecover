@@ -2,8 +2,12 @@
 -- The server re-checks superadmin on every action; the client check only hides the UI.
 
 local KINDS = { [0] = NOTIFY_GENERIC, [1] = NOTIFY_ERROR, [2] = NOTIFY_HINT, [3] = NOTIFY_GENERIC }
-local SOUNDS = { [0] = "buttons/button15.wav", [1] = "buttons/button10.wav",
-    [2] = "buttons/button14.wav", [3] = "buttons/blip1.wav" }
+local SOUNDS = {
+    [0] = "buttons/button15.wav",
+    [1] = "buttons/button10.wav",
+    [2] = "buttons/button14.wav",
+    [3] = "buttons/blip1.wav"
+}
 
 net.Receive("gmrecover.notify", function()
     local kind, text = net.ReadUInt(3), net.ReadString()
@@ -21,13 +25,16 @@ end
 
 -- name, label, min, max, decimals; checkbox when min/max are nil
 local SETTINGS = {
-    { "gmrecover_enabled", "Autosave enabled" },
-    { "gmrecover_interval", "Autosave interval (s)", 10, 3600, 0 },
-    { "gmrecover_keep", "Snapshots kept", 1, 50, 0 },
-    { "gmrecover_level", "Compression level (zstd)", 1, 19, 0 },
-    { "gmrecover_budget_ms", "Lua budget per tick (ms)", 0.1, 20, 1 },
-    { "gmrecover_holdoff", "Autosave pause after crash (s)", 0, 3600, 0 },
-    { "gmrecover_autorestore", "Auto-restore after crash (s, 0 = off)", 0, 3600, 0 },
+    { "gmrecover_enabled",     "Autosave enabled" },
+    { "gmrecover_t1_interval", "T1 (temp dir) interval (s, 0 = off)",          0,   600,  0 },
+    { "gmrecover_t1_keep",     "T1 snapshots kept",                            1,   50,   0 },
+    { "gmrecover_interval",    "T2 (data/) interval (s)",                      10,  3600, 0 },
+    { "gmrecover_keep",        "T2 snapshots kept",                            1,   50,   0 },
+    { "gmrecover_max_speed",   "Skip contraptions faster than (u/s, 0 = off)", 0,   2000, 0 },
+    { "gmrecover_level",       "Compression level (zstd)",                     1,   19,   0 },
+    { "gmrecover_budget_ms",   "Lua budget per tick (ms)",                     0.1, 20,   1 },
+    { "gmrecover_holdoff",     "Autosave pause after crash (s)",               0,   3600, 0 },
+    { "gmrecover_autorestore", "Auto-restore after crash (s, 0 = off)",        0,   3600, 0 },
 }
 
 local frame -- current menu, rebuilt on every open
@@ -41,7 +48,7 @@ local function status_text(st)
     local ls = st.last_save or {}
     -- optional lines are appended only when present: table.concat rejects nil holes
     local lines = { st.recovery_pending and "CRASH RECOVERY PENDING: restore or discard the last snapshot."
-        or "Running normally." }
+    or "Running normally." }
     if (st.holdoff_left or 0) > 0 then lines[#lines + 1] = "Autosave paused for " .. st.holdoff_left .. "s more." end
     if st.busy then lines[#lines + 1] = "Busy: " .. tostring(st.busy) end
     lines[#lines + 1] = (ls.time or 0) > 0
