@@ -16,7 +16,7 @@ Settings changed from the menu or console are mirrored to `data/gmrecover/settin
 
 Saved per owner, the same as an AdvDupe2 dupe: entity data, physics bones, color/material, bodygroups, network vars, all constraints (weld, axis, ballsocket, slider, rope, nocollide...) with alignment, parenting, Wire connections, ACF/ACE links, other `EntityMods`, and each bone's freeze state. Moving vehicles keep moving during autosave.
 
-Restore pastes through the AdvDupe2 queue as the owner. It is paced by `AdvDupe2_SpawnRate`, adds an undo entry, skips spawn limits, then reapplies freeze state.
+Restore pastes through the AdvDupe2 queue as the owner. It is paced by `AdvDupe2_SpawnRate`, adds an undo entry, skips spawn limits, and keeps everything frozen while placing. Once the paste finishes, parts saved unfrozen are unfrozen again; parts saved frozen stay frozen.
 
 ## Limitations
 

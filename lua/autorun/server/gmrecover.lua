@@ -606,24 +606,36 @@ hook.Add("AdvDupe_FinishPasting", "gmrecover.finish", function(data)
     if not info then return end
     active[d.EntityList] = nil
     bypass[info.ply] = nil
-    local n = 0
-    for _, ent in pairs(d.CreatedEntities or {}) do
+    local n, moving = 0, {}
+    for idx, ent in pairs(d.CreatedEntities or {}) do
         if IsValid(ent) then
             n = n + 1
             if IsValid(info.ply) and ent.CPPISetOwner and ent:CPPIGetOwner() ~= info.ply then
                 ent:CPPISetOwner(info.ply)
             end
-            -- restored builds stay frozen; owners unfreeze what they need
+            -- freeze while placing; bones saved unfrozen are released once the whole build is in
+            local fz = info.group.frozen[tonumber(idx)] or {}
             for b = 0, ent:GetPhysicsObjectCount() - 1 do
                 local phys = ent:GetPhysicsObjectNum(b)
-                if IsValid(phys) then phys:EnableMotion(false) end
+                if IsValid(phys) then
+                    phys:EnableMotion(false)
+                    local f = fz[b]
+                    if f == nil then f = fz[tostring(b)] end
+                    if f == false then moving[#moving + 1] = phys end
+                end
             end
+        end
+    end
+    for _, phys in ipairs(moving) do
+        if IsValid(phys) then
+            phys:EnableMotion(true)
+            phys:Wake()
         end
     end
     log("restored ", n, "/", info.group.count, " entities for ", IsValid(info.ply) and info.ply:Nick() or "?")
     if IsValid(info.ply) then
-        notify(info.ply, "success", ("%d of %d entities restored (frozen) with welds and wiring.")
-            :format(n, info.group.count))
+        notify(info.ply, "success", ("%d of %d entities restored with welds and wiring (%d parts unfrozen as saved).")
+            :format(n, info.group.count, #moving))
     end
 end)
 
