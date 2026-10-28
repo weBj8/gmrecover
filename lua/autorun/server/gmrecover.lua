@@ -261,18 +261,24 @@ do -- self-check
 end
 
 -- ---------- contraptions ----------
---- Everything welded/constrained/parented to `ent`, so a contraption is copied in one tick
---- (a copy spread over ticks of a moving tank stores parts at different poses).
+--- Everything welded/constrained/parented to `ent`, so a moving contraption's poses are taken in one tick.
 local function contraption(ent)
-    local out, stack = {}, { ent }
+    local out, stack, con_seen = {}, { ent }, {}
     while #stack > 0 do
         local e = table.remove(stack)
         if IsValid(e) and not out[e] then
             out[e] = true
-            for c in pairs(constraint.GetAllConstrainedEntities(e) or {}) do stack[#stack + 1] = c end
+            -- GetAllConstrainedEntities already returns the whole constrained set; one call per set keeps this O(n)
+            if not con_seen[e] then
+                for c in pairs(constraint.GetAllConstrainedEntities(e) or {}) do
+                    con_seen[c] = true
+                    stack[#stack + 1] = c
+                end
+            end
             for _, c in ipairs(e:GetChildren()) do stack[#stack + 1] = c end
             stack[#stack + 1] = e:GetParent()
         end
+        yield_if_spent() -- membership doesn't depend on pose, so the walk may span ticks
     end
     return out
 end
@@ -280,6 +286,29 @@ end
 local function speed(ent)
     local phys = ent:GetPhysicsObject()
     return (IsValid(phys) and phys:GetVelocity() or ent:GetVelocity()):Length()
+end
+
+--- World pose of an entity and its bones; cheap, so a whole contraption is taken in one tick.
+local function pose(ent)
+    local bones = {}
+    for b = 0, ent:GetPhysicsObjectCount() - 1 do
+        local phys = ent:GetPhysicsObjectNum(b)
+        if IsValid(phys) then bones[b] = { phys:GetPos(), phys:GetAngles() } end
+    end
+    return { pos = ent:GetPos(), ang = ent:GetAngles(), bones = bones }
+end
+
+--- Rewrites an AD2 entity copy (offset 0) to the pose `p`, mirroring CopyEntTable's PhysicsObjects math.
+local function apply_pose(tab, p)
+    local po = tab.PhysicsObjects
+    if not po then return end
+    for b, bp in pairs(p.bones) do
+        if po[b] then po[b].Pos, po[b].Angle = bp[1] - p.pos, bp[2] end
+    end
+    if po[0] then
+        po[0].Pos = p.pos
+        if not p.bones[0] or (tab.BuildDupeInfo and tab.BuildDupeInfo.DupeParentID) then po[0].Angle = p.ang end
+    end
 end
 
 -- ---------- serialization ----------
@@ -301,7 +330,8 @@ local function serialize(carry)
         end
     end
     yield_if_spent()
-    -- Phase 1: table copies. Moving contraptions in one tick each (consistent poses), static ones across ticks.
+    -- Phase 1: table copies spread across ticks. A moving contraption's poses are taken in one tick first
+    -- (positions only, cheap) and written into its copies, so parts stay consistent with each other.
     local max_speed = cv_max_speed:GetFloat()
     local done, copies, skipped = {}, {}, 0
     for _, root in ipairs(list) do
@@ -321,8 +351,11 @@ local function serialize(carry)
                     break
                 end
             end
-            -- static builds can't drift between ticks, so only moving ones are copied in one tick
-            local step = moving and function() end or yield_if_spent
+            local poses
+            if moving and not fast then
+                poses = {}
+                for _, e in ipairs(members) do poses[e] = pose(e) end
+            end
             if fast then
                 skipped = skipped + #members
             else
@@ -330,6 +363,7 @@ local function serialize(carry)
                     if IsValid(e) then
                         -- tab nil + info nil: AD2 says not copyable (DoNotDuplicate etc.), skip silently
                         local tab, info = copy_entity(api, e)
+                        if tab and poses then apply_pose(tab, poses[e]) end
                         if tab then
                             copies[#copies + 1] = {
                                 kind = "E",
@@ -343,7 +377,7 @@ local function serialize(carry)
                             log("skipped ", tostring(e), ": ", info)
                         end
                     end
-                    step()
+                    yield_if_spent()
                 end
                 for _, e in ipairs(members) do
                     for _, c in pairs(e.Constraints or {}) do
@@ -355,7 +389,7 @@ local function serialize(carry)
                             if okc and ct then copies[#copies + 1] = { kind = "C", sid = sid, tab = ct } end
                         end
                     end
-                    step()
+                    yield_if_spent()
                 end
             end
             yield_if_spent()
@@ -588,7 +622,8 @@ local function save(reason, tier)
 end
 
 local function autosave(tier)
-    if not cv_enabled:GetBool() or CurTime() < holdoff_until then return end
+    -- a big build can take longer than the T1 interval; skip this tick quietly, the running save covers it
+    if job or not cv_enabled:GetBool() or CurTime() < holdoff_until then return end
     -- T2 copies T1's latest result when it is fresh enough: no extra main-thread work
     if tier == 2 and last_data and CurTime() - last_data.time < cv_interval:GetFloat() then
         write_tier(2, last_data.data, last_data.count, "auto, from T1")
