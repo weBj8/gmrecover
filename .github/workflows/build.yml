@@ -75,11 +75,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild@0.24.0,cargo-xwin@0.23.1
-      # cc-rs needs llvm-lib; runner ships LLVM outside PATH.
-      - name: Add LLVM to PATH
+      # cc-rs needs llvm-lib on PATH.
+      # i686 needs lld-link >= 19 for /export EXPORTAS.
+      - name: Install LLVM 20
         if: matrix.cargo != 'zigbuild'
         run: |
-          llvm_bin="$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -1)"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq llvm-20 lld-20 clang-20
+          llvm_bin=/usr/lib/llvm-20/bin
           test -x "$llvm_bin/llvm-lib"
           echo "$llvm_bin" >> "$GITHUB_PATH"
       - name: Cache MSVC CRT/SDK (cargo-xwin)
